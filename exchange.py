@@ -88,6 +88,12 @@ class BinanceFuturesClient:
     def set_leverage(self, symbol: str, leverage: int) -> Dict:
         return self._get_client().futures_change_leverage(symbol=symbol, leverage=leverage)
 
+    @_retry_request
+    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict:
+        """마진 모드 설정. margin_type: "ISOLATED" | "CROSSED". 포지션 없을 때만 변경 가능."""
+        # python-binance: futures_change_margin_type(symbol, marginType)
+        return self._get_client().futures_change_margin_type(symbol=symbol, marginType=margin_type)
+
     def apply_slippage_buy(self, price: float, is_buy: bool = True) -> float:
         """매수 시 불리한 방향으로 슬리피지 적용 (매수면 올림)."""
         bps = self._slippage_bps / 10000.0
@@ -144,6 +150,27 @@ class BinanceFuturesClient:
         )
 
     @_retry_request
+    def create_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        reduce_only: bool = False,
+        time_in_force: str = "GTC",
+    ) -> Dict:
+        """지정가 주문 (메이커 수수료 적용). GTC=체결될 때까지 유지."""
+        return self._get_client().futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="LIMIT",
+            quantity=quantity,
+            price=round(price, 2),
+            timeInForce=time_in_force,
+            reduceOnly=reduce_only,
+        )
+
+    @_retry_request
     def create_stop_market_order(
         self,
         symbol: str,
@@ -176,6 +203,21 @@ class BinanceFuturesClient:
             quantity=quantity,
             stopPrice=round(stop_price, 2),
         )
+
+    @_retry_request
+    def get_order(self, symbol: str, order_id: int) -> Dict:
+        """주문 단건 조회 (체결 여부 확인용)."""
+        return self._get_client().futures_get_order(symbol=symbol, orderId=order_id)
+
+    @_retry_request
+    def cancel_order(self, symbol: str, order_id: int) -> Dict:
+        """지정가 등 주문 취소."""
+        return self._get_client().futures_cancel_order(symbol=symbol, orderId=order_id)
+
+    @_retry_request
+    def get_open_orders(self, symbol: str) -> List[Dict]:
+        """미체결 주문 목록."""
+        return self._get_client().futures_get_open_orders(symbol=symbol)
 
     def get_usdt_balance(self) -> float:
         """USDT 가용 잔고."""

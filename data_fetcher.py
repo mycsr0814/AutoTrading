@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 
 # 바이낸스 1봉당 1회 최대 1000개
 KLINES_LIMIT = 1000
-# 5년 = 5 * 365 * 24
+# N년 = N * 365 * 24 (시간 봉 수)
 HOURS_5Y = 5 * 365 * 24
+HOURS_10Y = 10 * 365 * 24
 
 
 def _klines_to_df(klines: List) -> pd.DataFrame:
@@ -89,18 +90,21 @@ def fetch_historical_1h(
     return out
 
 
-def load_or_fetch_5y_1h(
+def load_or_fetch_1h(
+    years: int = 5,
     cache_dir: Optional[Path] = None,
     symbol: str = config.SYMBOL,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
     """
-    ​5년치 1시간봉 로드. cache_dir에 CSV가 있으면 로드, 없거나 force_refresh면 API로 수집 후 저장.
+    N년치 1시간봉 로드. cache_dir에 CSV가 있으면 로드, 없거나 force_refresh면 API로 수집 후 저장.
+    years: 5 또는 10 등. 10년 = 약 87,600봉 (바이낸스 제공 한도 내).
     """
     if cache_dir is None:
         cache_dir = Path(__file__).resolve().parent / "data"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"{symbol}_1h_5y.csv"
+    cache_file = cache_dir / f"{symbol}_1h_{years}y.csv"
+    hours = years * 365 * 24
 
     if cache_file.exists() and not force_refresh:
         try:
@@ -113,7 +117,16 @@ def load_or_fetch_5y_1h(
         except Exception as e:
             logger.warning("캐시 로드 실패: %s", e)
 
-    df = fetch_historical_1h(symbol=symbol, hours=HOURS_5Y)
+    df = fetch_historical_1h(symbol=symbol, hours=hours)
     if not df.empty:
         df.to_csv(cache_file, index=False)
     return df
+
+
+def load_or_fetch_5y_1h(
+    cache_dir: Optional[Path] = None,
+    symbol: str = config.SYMBOL,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """5년치 1시간봉 로드 (load_or_fetch_1h(5) 래퍼)."""
+    return load_or_fetch_1h(years=5, cache_dir=cache_dir, symbol=symbol, force_refresh=force_refresh)

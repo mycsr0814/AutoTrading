@@ -1,0 +1,17 @@
+[
+  {
+    "label": "기본 설정",
+    "FILL_ON_NEXT_BAR_OPEN": true,
+    "VOLATILITY_FILTER_ENABLED": false
+  },
+  {
+    "label": "변동성 필터 켬",
+    "FILL_ON_NEXT_BAR_OPEN": true,
+    "VOLATILITY_FILTER_ENABLED": true
+  },
+  {
+    "label": "손익비 2.5 + 1차익절 60%",
+    "TP_RR_RATIO": 2.5,
+    "TP_FIRST_HALF": 0.6
+  }
+]

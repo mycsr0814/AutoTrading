@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-백테스트 엔진.
+백테스트 엔진 (실전 근사).
 - 1봉씩 순차 처리하여 미래 참조(look-ahead) 방지.
-- 수수료·슬리피지 적용.
+- 수수료·슬리피지·진입/청산 체결 방식 반영.
+
+[백테스트 오류 방지]
+- 지표/신호는 해당 봉 마감 시점만 사용 (merge_asof backward).
+- 동일 봉 내: 청산가 → 손절 → 익절 순 검사 (손절 우선 보수적 가정).
+- 진입: FILL_ON_NEXT_BAR_OPEN 시 다음 봉에서만 체결; ENTRY_LIMIT_AT_LEVEL 시 지정가 체결 시뮬(레벨 터치 시 메이커).
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -11,13 +16,13 @@ import numpy as np
 
 import config
 from candles import ensure_ohlcv, add_engulfing_flags
-from strategy import run_signal_on_bar, StrategyState
+from strategy import run_signal_on_bar, StrategyState, _reset_state_after_exit
 
 
 def _add_4h_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
     """
     1h 봉 데이터에 '마지막 마감된 4h 봉' 종가·EMA50 컬럼 추가.
-    추세 필터: 4h 종가 > 4h EMA50 → 롱만, 4h 종가 < 4h EMA50 → 숏만.
+    추세 필터: 4h 종가 > 4h EMA50 → 롱만.
     미래 참조 없이 과거 4h 봉만 사용. 원본 봉 순서 유지.
     """
     if df is None or len(df) < 2:
@@ -35,6 +40,11 @@ def _add_4h_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
         df["trend_4h_close"] = np.nan
         df["trend_4h_ema50"] = np.nan
         df["atr_4h"] = np.nan
+        df["trend_4h_body"] = np.nan
+        df["trend_4h_upper_wick"] = np.nan
+        df["trend_4h_lower_wick"] = np.nan
+        df["trend_4h_low"] = np.nan
+        df["trend_4h_high"] = np.nan
         df = df.drop(columns=["_dt"], errors="ignore")
         return df
     resampled["ema50"] = resampled["close"].ewm(span=config.TREND_EMA_PERIOD, adjust=False).mean()
@@ -46,10 +56,14 @@ def _add_4h_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
         (resampled["low"] - prev_close_4h).abs(),
     ], axis=1).max(axis=1)
     resampled["atr_4h"] = tr_4h.rolling(window=getattr(config, "ATR_PERIOD", 14), min_periods=1).mean()
+    # 4h 봉 몸통·윗꼬리·아랫꼬리 (익절 조건: 윗꼬리 > N*몸통 시 롱 익절)
+    resampled["body_4h"] = (resampled["close"] - resampled["open"]).abs()
+    resampled["upper_wick_4h"] = resampled["high"] - resampled[["open", "close"]].max(axis=1)
+    resampled["lower_wick_4h"] = resampled[["open", "close"]].min(axis=1) - resampled["low"]
     resampled["close_time_4h"] = (resampled.index + pd.Timedelta(hours=config.TREND_TIMEFRAME_HOURS)).astype("datetime64[ns]")
-    merge_right = resampled[["close_time_4h", "close", "ema50", "atr_4h"]].rename(
-        columns={"close": "trend_4h_close", "ema50": "trend_4h_ema50"}
-    )
+    merge_right = resampled[
+        ["close_time_4h", "close", "ema50", "atr_4h", "body_4h", "upper_wick_4h", "lower_wick_4h", "low", "high"]
+    ].rename(columns={"close": "trend_4h_close", "ema50": "trend_4h_ema50", "low": "trend_4h_low", "high": "trend_4h_high"})
     left_key = df_sorted["_dt"].astype("datetime64[ns]")
     merged = pd.merge_asof(
         df_sorted.assign(_dt_ns=left_key),
@@ -63,6 +77,11 @@ def _add_4h_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
     df["trend_4h_close"] = df["open_time"].map(by_ot["trend_4h_close"])
     df["trend_4h_ema50"] = df["open_time"].map(by_ot["trend_4h_ema50"])
     df["atr_4h"] = df["open_time"].map(by_ot["atr_4h"])
+    df["trend_4h_body"] = df["open_time"].map(by_ot["body_4h"])
+    df["trend_4h_upper_wick"] = df["open_time"].map(by_ot["upper_wick_4h"])
+    df["trend_4h_lower_wick"] = df["open_time"].map(by_ot["lower_wick_4h"])
+    df["trend_4h_low"] = df["open_time"].map(by_ot["trend_4h_low"])
+    df["trend_4h_high"] = df["open_time"].map(by_ot["trend_4h_high"])
     df = df.drop(columns=["_dt"], errors="ignore")
     return df
 
@@ -70,8 +89,7 @@ def _add_4h_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
 def _add_daily_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
     """
     1h 봉에 '마지막 마감된 일봉' 종가·EMA20·EMA50·하락장저항 플래그 추가.
-    일봉 추세 필터: 일봉 종가 > 일봉 EMA → 롱만, 일봉 종가 < 일봉 EMA → 숏만.
-    하락장 최적화: 일봉상 EMA 20/50에 윗꼬리가 반복 저항받으면 bear_market_resistance=True → 숏만 진입.
+    일봉 추세 필터: 일봉 종가 > 일봉 EMA → 롱만.
     """
     if df is None or len(df) < 2:
         return df
@@ -79,8 +97,8 @@ def _add_daily_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
     bear_enabled = getattr(config, "BEAR_MARKET_RESISTANCE_ENABLED", False)
     bear_regime_enabled = getattr(config, "BEAR_REGIME_DEATH_CROSS_ENABLED", False)
     strict_filter = getattr(config, "BEAR_MARKET_STRICT_LONG_FILTER", False)
-    wick_short_enabled = getattr(config, "DAILY_WICK_BEAR_SHORT_ENABLED", False)
-    if not use and not bear_enabled and not bear_regime_enabled and not strict_filter and not wick_short_enabled:
+    daily_pullback = getattr(config, "DAILY_PULLBACK_LONG_ENABLED", False)
+    if not use and not bear_enabled and not bear_regime_enabled and not strict_filter and not daily_pullback:
         return df
     df = df.copy()
     if "open_time" not in df.columns:
@@ -99,8 +117,9 @@ def _add_daily_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
         df["bear_market_resistance"] = False
         df["bear_regime"] = False
         df["bear_market_strict"] = False
-        df["trend_daily_high"] = np.nan
-        df["daily_wick_bear_short_signal"] = False
+        if daily_pullback:
+            df["prev_daily_high"] = np.nan
+            df["prev_daily_low"] = np.nan
         df = df.drop(columns=["_dt"], errors="ignore")
         return df
     resampled["ema"] = resampled["close"].ewm(span=period, adjust=False).mean()
@@ -129,18 +148,13 @@ def _add_daily_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
     if strict_filter:
         strict_days = getattr(config, "BEAR_MARKET_STRICT_LONG_DAYS", 5)
         resampled["bear_market_strict"] = (resampled["close"] < resampled["ema50"]).astype(int).rolling(strict_days, min_periods=strict_days).sum() >= strict_days
-    # 일봉 윗꼬리 저항(전일) + 당일 음봉·EMA20 아래 → 다음날 첫 1h봉에 숏 시그널
-    if wick_short_enabled:
-        prev_body_high = resampled[["open", "close"]].shift(1).max(axis=1)
-        prev_upper_wick = resampled["high"].shift(1) > prev_body_high
-        prev_below_ema = resampled["close"].shift(1) < resampled["ema"].shift(1)
-        curr_bearish = resampled["close"] < resampled["open"]
-        curr_below_ema = resampled["close"] < resampled["ema"]
-        resampled["daily_wick_bear_short_signal"] = prev_upper_wick & prev_below_ema & curr_bearish & curr_below_ema
     resampled["_merge_key"] = (resampled.index + pd.Timedelta(days=1)).astype("datetime64[ns]")
-    merge_rename = {"close": "trend_daily_close", "ema": "trend_daily_ema", "ema50": "trend_daily_ema50", "high": "trend_daily_high"}
+    merge_rename = {"close": "trend_daily_close", "ema": "trend_daily_ema", "ema50": "trend_daily_ema50"}
+    if daily_pullback:
+        merge_rename["high"] = "prev_daily_high"
+        merge_rename["low"] = "prev_daily_low"
     need_ema50 = bear_regime_enabled or bear_enabled or strict_filter
-    merge_cols = ["_merge_key", "close", "ema"] + (["high"] if wick_short_enabled else []) + (["ema50"] if need_ema50 else []) + (["bear_regime"] if (bear_regime_enabled or bear_enabled) else []) + (["bear_market_resistance"] if bear_enabled else []) + (["bear_market_strict"] if strict_filter else []) + (["daily_wick_bear_short_signal"] if wick_short_enabled else [])
+    merge_cols = ["_merge_key", "close", "ema"] + (["high", "low"] if daily_pullback else []) + (["ema50"] if need_ema50 else []) + (["bear_regime"] if (bear_regime_enabled or bear_enabled) else []) + (["bear_market_resistance"] if bear_enabled else []) + (["bear_market_strict"] if strict_filter else [])
     merge_right = resampled[merge_cols].rename(columns=merge_rename).sort_values("_merge_key")
     left_key = df_sorted["_dt"].astype("datetime64[ns]")
     merged = pd.merge_asof(
@@ -158,23 +172,23 @@ def _add_daily_trend_to_1h(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["trend_daily_ema50"] = np.nan
     if bear_regime_enabled or bear_enabled:
-        df["bear_regime"] = df["open_time"].map(by_ot["bear_regime"]).fillna(False)
+        _br = df["open_time"].map(by_ot["bear_regime"])
+        df["bear_regime"] = _br.where(_br.notna(), other=False).astype(bool)
     else:
         df["bear_regime"] = False
     if bear_enabled:
-        df["bear_market_resistance"] = df["open_time"].map(by_ot["bear_market_resistance"]).fillna(False)
+        _bmr = df["open_time"].map(by_ot["bear_market_resistance"])
+        df["bear_market_resistance"] = _bmr.where(_bmr.notna(), other=False).astype(bool)
     else:
         df["bear_market_resistance"] = False
     if strict_filter:
-        df["bear_market_strict"] = df["open_time"].map(by_ot["bear_market_strict"]).fillna(False)
+        _bms = df["open_time"].map(by_ot["bear_market_strict"])
+        df["bear_market_strict"] = _bms.where(_bms.notna(), other=False).astype(bool)
     else:
         df["bear_market_strict"] = False
-    if wick_short_enabled:
-        df["trend_daily_high"] = df["open_time"].map(by_ot["trend_daily_high"])
-        df["daily_wick_bear_short_signal"] = df["open_time"].map(by_ot["daily_wick_bear_short_signal"]).fillna(False)
-    else:
-        df["trend_daily_high"] = np.nan
-        df["daily_wick_bear_short_signal"] = False
+    if daily_pullback:
+        df["prev_daily_high"] = df["open_time"].map(by_ot["prev_daily_high"])
+        df["prev_daily_low"] = df["open_time"].map(by_ot["prev_daily_low"])
     df = df.drop(columns=["_dt"], errors="ignore")
     return df
 
@@ -210,6 +224,23 @@ class BacktestTrade:
     stop_price: Optional[float] = None
     tp_price: Optional[float] = None
     detail: Optional[dict] = None
+    pnl: Optional[float] = None  # 청산 시 실현 손익(USDT). 롱/숏별 승률·수익률 집계용.
+
+
+def _add_atr_percentile(df: pd.DataFrame) -> pd.DataFrame:
+    """ATR 백분위(최근 N봉 내) 추가. 변동성 필터용. 미래 참조 없음."""
+    if df is None or "atr" not in df.columns:
+        return df
+    lookback = getattr(config, "VOL_ATR_LOOKBACK", 168)
+    # 현재 봉 ATR이 롤링 창 내에서 몇 % 위에 있는지 (100 = 최고)
+    def _pct(s: pd.Series) -> float:
+        if len(s) < 2 or pd.isna(s.iloc[-1]):
+            return 50.0
+        last = s.iloc[-1]
+        return float((s <= last).sum() / len(s) * 100.0)
+    df = df.copy()
+    df["atr_pct"] = df["atr"].astype(float).rolling(window=lookback, min_periods=min(lookback, len(df))).apply(_pct, raw=False)
+    return df
 
 
 def prepare_1h_df_for_signal(df: pd.DataFrame) -> pd.DataFrame:
@@ -224,7 +255,57 @@ def prepare_1h_df_for_signal(df: pd.DataFrame) -> pd.DataFrame:
     df = _add_4h_trend_to_1h(df)
     df = _add_daily_trend_to_1h(df)
     df = _add_atr(df)
+    if getattr(config, "VOLATILITY_FILTER_ENABLED", False):
+        df = _add_atr_percentile(df)
     return df.reset_index(drop=True)
+
+
+def _close_all_positions(
+    positions: List[dict],
+    exit_price: float,
+    capital: float,
+    leverage: int,
+    fee_rate: float,
+    bar_idx: int,
+    action: str,
+    detail: Optional[dict],
+) -> tuple:
+    """전량 청산: 시장가(테이커) 수수료 + 실전 근사 청산 슬리피지 적용 후 capital 갱신."""
+    if not positions:
+        return capital, None
+    # 실전 근사: 롱 청산(매도)=불리한 방향으로 하락, 숏 청산(매수)=불리한 방향으로 상승
+    slip_bps = getattr(config, "EXIT_SLIPPAGE_BPS", None)
+    if slip_bps is None:
+        slip_bps = getattr(config, "SLIPPAGE_BPS", 0) or 0
+    if slip_bps > 0:
+        exit_side = positions[0]["side"]
+        if exit_side == "LONG":
+            exit_price = exit_price * (1.0 - slip_bps / 10000.0)
+        else:
+            exit_price = exit_price * (1.0 + slip_bps / 10000.0)
+    cap_before = capital
+    exit_side = positions[0]["side"]
+    total_fee = 0.0
+    for pos in positions:
+        notional = pos["entry_capital"] * pos["size_pct"] * leverage
+        fee = notional * fee_rate
+        total_fee += fee
+        capital -= fee
+        if pos["side"] == "LONG":
+            capital += notional * (exit_price - pos["entry"]) / pos["entry"]
+        else:
+            capital += notional * (pos["entry"] - exit_price) / pos["entry"]
+    pnl = capital - cap_before
+    return capital, BacktestTrade(
+        bar_idx=bar_idx,
+        action=action,
+        side=exit_side,
+        price=exit_price,
+        size_pct=0,
+        fee=total_fee,
+        detail=detail,
+        pnl=pnl,
+    )
 
 
 def run_backtest(
@@ -232,36 +313,167 @@ def run_backtest(
     initial_capital: float = 10000.0,
     leverage: int = None,
     fee_rate: float = None,
+    fee_entry: float = None,
 ) -> tuple:
     """
-    봉 단위 순차 백테스트. 각 봉에서 그 봉의 OHLC만 사용 (미래 데이터 미사용).
-    반환: (거래 목록, 일별/봉별 손익 시리즈, 최종 자산, info, 사용한 DataFrame)
+    봉 단위 순차 백테스트. 실전 근사 및 오류 방지:
+
+    [미래 참조 금지]
+    - 각 봉 i에서 df.iloc[:i+1]까지만 사용. 지표는 merge_asof(backward)로 해당 봉 마감 시점만 반영.
+
+    [동일 봉 내 처리 순서] (실전과 동일한 체결 우선순위)
+    1. 전 봉 신호에 의한 다음 봉 시가 진입 (pending_entry) → 포지션 추가
+    2. 청산가(레버리지) 도달 시 강제 청산
+    3. run_signal_on_bar() → 손절 검사(우선) → 4h윗꼬리/반대장악/추가진입/추세이탈/트레일링/1차 익절 순
+    4. 진입 신호 시 fill_next_bar면 다음 봉에서 체결, 아니면 당일 체결
+    5. 자산 하한선 이하 시 강제 청산, 봉 말 미청산 포지션은 종가 기준 손익 반영
+
+    [체결 가정]
+    - 진입: FILL_ON_NEXT_BAR_OPEN=True면 다음 봉 시가+진입 슬리피지. 청산: 시장가(테이커)+EXIT_SLIPPAGE_BPS.
+    - 동일 봉에서 손절가·익절가 동시 터치 시 손절 우선 검사하여 손절로 처리 (보수적).
+    반환: (거래 목록, 봉별 자산 시리즈, 최종 자산, info, 사용한 DataFrame)
     """
     if df is None or len(df) < 3:
         return [], pd.Series(dtype=float), initial_capital, {}, None
 
     leverage = leverage or config.LEVERAGE
     fee_rate = fee_rate or config.FEE_EFFECTIVE
+    fee_entry = fee_entry if fee_entry is not None else getattr(config, "FEE_ENTRY", config.FEE_MAKER)
     df = prepare_1h_df_for_signal(df)
 
     capital = initial_capital
     state = StrategyState()
     trades: List[BacktestTrade] = []
-    # 포지션: (진입가, 비중(자금대비), 손절가, 1차TP가, 1차TP청산여부)
     positions: List[dict] = []
-    equity_curve = []
+    n_bars = len(df) - 1  # 루프 횟수 (i=1..len(df)-1)
+    equity_curve: List[float] = [0.0] * n_bars  # 사전 할당
+    fill_next_bar = getattr(config, "FILL_ON_NEXT_BAR_OPEN", False)
+    next_bar_slip_bps = getattr(config, "FILL_NEXT_BAR_SLIPPAGE_BPS", 5) or 0
+    fee_maker = getattr(config, "FEE_MAKER", config.FEE_MAKER)
+    pending_entry: Optional[dict] = None  # {side, size_pct, stop, tp1, action, bar_idx_signal, detail, limit_price}
 
     for i in range(1, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1]
-        # 현재 시점에서는 i번째 봉까지만 존재 (i+1 이후 미사용)
+        low_bar = float(row["low"])
+        high_bar = float(row["high"])
+        close_price = float(row["close"])
+        open_price = float(row["open"])
+
+        # 실전 근사: 전 봉에서 발생한 진입 신호를 현재 봉에서 체결 (동일 봉 look-ahead 제거)
+        # ENTRY_LIMIT_AT_LEVEL: 지정가 at 눌림 레벨 시뮬 — 봉 내 가격이 limit_price 터치 시에만 해당 가격에 메이커 체결, 미터치 시 다음 봉까지 대기
+        if pending_entry is not None:
+            side = pending_entry["side"]
+            size_pct = pending_entry["size_pct"]
+            limit_price = pending_entry.get("limit_price")
+            entry_limit_at_level = getattr(config, "ENTRY_LIMIT_AT_LEVEL", False)
+            do_fill = True
+            entry_fill = open_price
+            fee_entry_use = fee_entry
+            if entry_limit_at_level and limit_price is not None and limit_price > 0:
+                touched = (side == "LONG" and low_bar <= limit_price) or (side == "SHORT" and high_bar >= limit_price)
+                if touched:
+                    entry_fill = float(limit_price)
+                    fee_entry_use = fee_maker
+                else:
+                    do_fill = False
+            else:
+                if next_bar_slip_bps and side == "LONG":
+                    entry_fill = open_price * (1.0 + next_bar_slip_bps / 10000.0)
+                elif next_bar_slip_bps and side == "SHORT":
+                    entry_fill = open_price * (1.0 - next_bar_slip_bps / 10000.0)
+            if do_fill:
+                notional = capital * size_pct * leverage
+                fee = notional * fee_entry_use
+                capital -= fee
+                positions.append({
+                    "entry": entry_fill,
+                    "size_pct": size_pct,
+                    "entry_capital": capital,
+                    "stop": pending_entry["stop"],
+                    "tp1": pending_entry["tp1"],
+                    "side": side,
+                    "tp1_done": False,
+                })
+                trades.append(
+                    BacktestTrade(
+                        bar_idx=i,
+                        action=pending_entry["action"],
+                        side=side,
+                        price=entry_fill,
+                        size_pct=size_pct,
+                        fee=fee,
+                        stop_price=pending_entry.get("stop"),
+                        tp_price=pending_entry.get("tp1"),
+                        detail=pending_entry.get("detail"),
+                    )
+                )
+                pending_entry = None
+
+        # 실거래와 동일: 청산은 "손절보다 가격이 먼저 도달했을 때"만. 로스컷(손절)이 청산가보다 먼저 있으면 손절로 나감.
+        # 롱: 가격 하락 시 더 위에 있는 쪽(진입가에 가까운 쪽)을 먼저 침 → 청산가 > 손절가 이면 청산, 아니면 손절.
+        # 숏: 가격 상승 시 더 아래 있는 쪽을 먼저 침 → 청산가 < 손절가 이면 청산, 아니면 손절.
+        liq_price_enabled = getattr(config, "BACKTEST_LIQUIDATION_PRICE_ENABLED", False)
+        if liq_price_enabled and positions:
+            stop_price = positions[0].get("stop")  # 동일 셋업이면 손절가는 동일
+            liq_triggered = False
+            exit_price_liq = None
+            exit_side_liq = None
+            for pos in positions:
+                entry = pos["entry"]
+                side = pos["side"]
+                stop_p = pos.get("stop")
+                if stop_p is None:
+                    stop_p = stop_price
+                # 거래소 청산가 근사: 롱 = 진입가 대비 1/레버리지 하락, 숏 = 1/레버리지 상승
+                if side == "LONG":
+                    liq_p = entry * (1.0 - 1.0 / leverage)
+                    # 청산가가 손절가보다 위(진입가에 가까움)일 때만 청산. 그렇지 않으면 이 봉에서는 손절이 먼저 터짐.
+                    if low_bar <= liq_p and (stop_p is None or liq_p > stop_p):
+                        liq_triggered = True
+                        exit_price_liq = liq_p if exit_price_liq is None else max(exit_price_liq, liq_p)
+                        exit_side_liq = "LONG"
+                else:
+                    liq_p = entry * (1.0 + 1.0 / leverage)
+                    if high_bar >= liq_p and (stop_p is None or liq_p < stop_p):
+                        liq_triggered = True
+                        exit_price_liq = liq_p if exit_price_liq is None else min(exit_price_liq, liq_p)
+                        exit_side_liq = "SHORT"
+            if liq_triggered and exit_price_liq is not None:
+                cap_before_liq = capital
+                exit_side_liq = exit_side_liq or (positions[0]["side"])
+                for pos in positions:
+                    notional = pos["entry_capital"] * pos["size_pct"] * leverage
+                    fee = notional * fee_rate
+                    capital -= fee
+                    if pos["side"] == "LONG":
+                        capital += notional * (exit_price_liq - pos["entry"]) / pos["entry"]
+                    else:
+                        capital += notional * (pos["entry"] - exit_price_liq) / pos["entry"]
+                capital = max(capital, initial_capital * getattr(config, "BACKTEST_LIQUIDATION_PCT", 0.05))
+                positions = []
+                _reset_state_after_exit(state, i, set_cooldown=False)
+                trades.append(
+                    BacktestTrade(
+                        bar_idx=i,
+                        action="LIQUIDATION",
+                        side=exit_side_liq,
+                        price=exit_price_liq,
+                        size_pct=0,
+                        fee=0,
+                        detail={"reason": "liquidation_price_hit", "leverage": leverage},
+                        pnl=capital - cap_before_liq,
+                    )
+                )
+                equity_curve[i - 1] = capital
+                continue
+
+        # look-ahead 방지: i번째 봉까지만 전달 (df.iloc[:i+1]). 전략은 미래 봉/미래 지표 참조 불가.
         state, action, detail = run_signal_on_bar(
             i, row, prev_row, df.iloc[: i + 1], state, fee_rate=fee_rate
         )
 
-        close_price = float(row["close"])
-
-        if action == "OPEN_1" or action == "OPEN_2":
+        if action in ("OPEN_1", "OPEN_2", "OPEN_ADD", "OPEN_TREND_ADD"):
             if detail:
                 entry_price = detail.get("entry", close_price)
                 stop_price = detail.get("stop")
@@ -272,42 +484,59 @@ def run_backtest(
                 stop_price = None
                 tp_price = None
                 size_pct = 0.1
-            notional = capital * size_pct * leverage
-            fee = notional * fee_rate
-            capital -= fee
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=state.positions[-1].side if state.positions else "LONG",
-                    price=entry_price,
-                    size_pct=size_pct,
-                    fee=fee,
-                    stop_price=stop_price,
-                    tp_price=tp_price,
-                    detail=detail,
+            side = state.positions[-1].side if state.positions else "LONG"
+            if fill_next_bar:
+                pending_entry = {
+                    "side": side,
+                    "size_pct": size_pct,
+                    "stop": stop_price,
+                    "tp1": tp_price,
+                    "action": action,
+                    "bar_idx_signal": i,
+                    "detail": detail,
+                    "limit_price": detail.get("limit_price") if detail else None,
+                }
+            else:
+                notional = capital * size_pct * leverage
+                fee = notional * fee_entry
+                capital -= fee
+                trades.append(
+                    BacktestTrade(
+                        bar_idx=i,
+                        action=action,
+                        side=side,
+                        price=entry_price,
+                        size_pct=size_pct,
+                        fee=fee,
+                        stop_price=stop_price,
+                        tp_price=tp_price,
+                        detail=detail,
+                    )
                 )
-            )
-            positions.append({
-                "entry": entry_price,
-                "size_pct": size_pct,
-                "entry_capital": capital,
-                "stop": stop_price,
-                "tp1": tp_price,
-                "side": state.positions[-1].side,
-                "tp1_done": False,
-            })
+                positions.append({
+                    "entry": entry_price,
+                    "size_pct": size_pct,
+                    "entry_capital": capital,
+                    "stop": stop_price,
+                    "tp1": tp_price,
+                    "side": side,
+                    "tp1_done": False,
+                })
 
         elif action == "TP_FIRST":
+            cap_before_tp = capital
             tp_fee = 0.0
+            close_pct = detail.get("close_pct", config.TP_FIRST_HALF) if detail else config.TP_FIRST_HALF
+            # 1차 익절 지정가(TP_FIRST_LIMIT_ORDER)면 메이커 수수료만, 슬리피지 없음(체결가=익절가 그대로)
+            use_tp_limit = getattr(config, "TP_FIRST_LIMIT_ORDER", False)
+            tp_fee_rate = config.FEE_MAKER if use_tp_limit else fee_rate
             if detail and positions:
-                tp_price = detail.get("price", close_price)
+                tp_price = detail.get("price", close_price)  # 지정가면 정확히 이 가격에 체결
                 for pos in positions:
                     if not pos.get("tp1_done"):
                         pos["tp1_done"] = True
-                        close_pct = config.TP_FIRST_HALF
                         notional = pos["entry_capital"] * pos["size_pct"] * leverage * close_pct
-                        fee = notional * fee_rate
+                        fee = notional * tp_fee_rate
                         tp_fee = fee
                         capital -= fee
                         if pos["side"] == "LONG":
@@ -316,6 +545,9 @@ def run_backtest(
                             capital += notional * (pos["entry"] - tp_price) / pos["entry"]
                         pos["size_pct"] *= (1 - close_pct)
                         break
+                if close_pct >= 1.0:
+                    positions = []
+                    _reset_state_after_exit(state, i, set_cooldown=False)
             trades.append(
                 BacktestTrade(
                     bar_idx=i,
@@ -325,176 +557,27 @@ def run_backtest(
                     size_pct=detail.get("size_pct", 0) if detail else 0,
                     fee=tp_fee,
                     detail=detail,
+                    pnl=capital - cap_before_tp,
                 )
             )
 
-        elif action == "STOP":
-            stop_price = detail.get("price", close_price) if detail else close_price
-            exit_side = positions[0]["side"] if positions else "LONG"
-            for pos in positions:
-                notional = pos["entry_capital"] * pos["size_pct"] * leverage
-                fee = notional * fee_rate
-                capital -= fee
-                if pos["side"] == "LONG":
-                    capital += notional * (stop_price - pos["entry"]) / pos["entry"]
-                else:
-                    capital += notional * (pos["entry"] - stop_price) / pos["entry"]
-            positions = []
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=exit_side,
-                    price=stop_price,
-                    size_pct=0,
-                    fee=0,
-                    detail=detail,
-                )
+        elif action in (
+            "STOP",
+            "TRAILING_STOP",
+            "TREND_BREAK_EXIT",
+            "EOD_EXIT",
+            "EOY_PROFIT_LOCK",
+            "GIVEBACK_EXIT",
+            "REVERSE_ENGULF_EXIT",
+            "TP_4H_WICK_EXIT",
+        ):
+            exit_price = (detail.get("price", close_price) if detail else close_price)
+            capital, trade = _close_all_positions(
+                positions, exit_price, capital, leverage, fee_rate, i, action, detail
             )
-
-        elif action == "TRAILING_STOP":
-            trail_price = detail.get("price", close_price) if detail else close_price
-            exit_side = positions[0]["side"] if positions else "LONG"
-            for pos in positions:
-                notional = pos["entry_capital"] * pos["size_pct"] * leverage
-                fee = notional * fee_rate
-                capital -= fee
-                if pos["side"] == "LONG":
-                    capital += notional * (trail_price - pos["entry"]) / pos["entry"]
-                else:
-                    capital += notional * (pos["entry"] - trail_price) / pos["entry"]
-            positions = []
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=exit_side,
-                    price=trail_price,
-                    size_pct=0,
-                    fee=0,
-                    detail=detail,
-                )
-            )
-
-        elif action == "TREND_BREAK_EXIT":
-            exit_price = detail.get("price", close_price) if detail else close_price
-            exit_side = positions[0]["side"] if positions else "LONG"
-            for pos in positions:
-                notional = pos["entry_capital"] * pos["size_pct"] * leverage
-                fee = notional * fee_rate
-                capital -= fee
-                if pos["side"] == "LONG":
-                    capital += notional * (exit_price - pos["entry"]) / pos["entry"]
-                else:
-                    capital += notional * (pos["entry"] - exit_price) / pos["entry"]
-            positions = []
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=exit_side,
-                    price=exit_price,
-                    size_pct=0,
-                    fee=0,
-                    detail=detail,
-                )
-            )
-
-        elif action == "EOD_EXIT":
-            eod_price = detail.get("price", close_price) if detail else close_price
-            exit_side = positions[0]["side"] if positions else "LONG"
-            for pos in positions:
-                notional = pos["entry_capital"] * pos["size_pct"] * leverage
-                fee = notional * fee_rate
-                capital -= fee
-                if pos["side"] == "LONG":
-                    capital += notional * (eod_price - pos["entry"]) / pos["entry"]
-                else:
-                    capital += notional * (pos["entry"] - eod_price) / pos["entry"]
-            positions = []
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=exit_side,
-                    price=eod_price,
-                    size_pct=0,
-                    fee=0,
-                    detail=detail,
-                )
-            )
-
-        elif action == "EOY_PROFIT_LOCK":
-            eoy_price = detail.get("price", close_price) if detail else close_price
-            exit_side = positions[0]["side"] if positions else "LONG"
-            for pos in positions:
-                notional = pos["entry_capital"] * pos["size_pct"] * leverage
-                fee = notional * fee_rate
-                capital -= fee
-                if pos["side"] == "LONG":
-                    capital += notional * (eoy_price - pos["entry"]) / pos["entry"]
-                else:
-                    capital += notional * (pos["entry"] - eoy_price) / pos["entry"]
-            positions = []
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=exit_side,
-                    price=eoy_price,
-                    size_pct=0,
-                    fee=0,
-                    detail=detail,
-                )
-            )
-
-        elif action == "GIVEBACK_EXIT":
-            gb_price = detail.get("price", close_price) if detail else close_price
-            exit_side = positions[0]["side"] if positions else "LONG"
-            for pos in positions:
-                notional = pos["entry_capital"] * pos["size_pct"] * leverage
-                fee = notional * fee_rate
-                capital -= fee
-                if pos["side"] == "LONG":
-                    capital += notional * (gb_price - pos["entry"]) / pos["entry"]
-                else:
-                    capital += notional * (pos["entry"] - gb_price) / pos["entry"]
-            positions = []
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=exit_side,
-                    price=gb_price,
-                    size_pct=0,
-                    fee=0,
-                    detail=detail,
-                )
-            )
-
-        elif action == "REVERSE_ENGULF_EXIT":
-            exit_price = detail.get("price", close_price) if detail else close_price
-            exit_side = positions[0]["side"] if positions else "LONG"
-            for pos in positions:
-                notional = pos["entry_capital"] * pos["size_pct"] * leverage
-                fee = notional * fee_rate
-                capital -= fee
-                if pos["side"] == "LONG":
-                    capital += notional * (exit_price - pos["entry"]) / pos["entry"]
-                else:
-                    capital += notional * (pos["entry"] - exit_price) / pos["entry"]
-            positions = []
-            trades.append(
-                BacktestTrade(
-                    bar_idx=i,
-                    action=action,
-                    side=exit_side,
-                    price=exit_price,
-                    size_pct=0,
-                    fee=0,
-                    detail=detail,
-                )
-            )
+            positions = []  # strategy.run_signal_on_bar에서 이미 state 초기화됨
+            if trade:
+                trades.append(trade)
 
         # 미실현 손익 (포지션 유지 중)
         total_unrealized = 0.0
@@ -504,12 +587,46 @@ def run_backtest(
                 total_unrealized += notional * (close_price - pos["entry"]) / pos["entry"]
             else:
                 total_unrealized += notional * (pos["entry"] - close_price) / pos["entry"]
-        equity_curve.append(capital + total_unrealized)
+        current_equity = capital + total_unrealized
+
+        # 청산 시뮬레이션 (레버리지 백테스트 오류 방지: 자산이 초기자본의 N% 이하로 떨어지면 강제 청산)
+        liq_enabled = getattr(config, "BACKTEST_LIQUIDATION_ENABLED", False)
+        liq_pct = getattr(config, "BACKTEST_LIQUIDATION_PCT", 0.05)
+        if liq_enabled and positions and current_equity < initial_capital * liq_pct:
+            cap_before_liq = capital
+            exit_side = positions[0]["side"]
+            for pos in positions:
+                notional = pos["entry_capital"] * pos["size_pct"] * leverage
+                fee = notional * fee_rate
+                capital -= fee
+                if pos["side"] == "LONG":
+                    capital += notional * (close_price - pos["entry"]) / pos["entry"]
+                else:
+                    capital += notional * (pos["entry"] - close_price) / pos["entry"]
+            capital = max(capital, initial_capital * liq_pct)  # 남은 자산을 최소 수준으로 제한
+            positions = []
+            _reset_state_after_exit(state, i, set_cooldown=False)
+            trades.append(
+                BacktestTrade(
+                    bar_idx=i,
+                    action="LIQUIDATION",
+                    side=exit_side,
+                    price=close_price,
+                    size_pct=0,
+                    fee=0,
+                    detail={"reason": "equity_below_threshold", "equity_pct": current_equity / initial_capital},
+                    pnl=capital - cap_before_liq,
+                )
+            )
+            total_unrealized = 0.0
+
+        equity_curve[i - 1] = capital + total_unrealized
 
     # 미청산 포지션을 마지막 봉 종가로 정산 (연도별 거래수에 반영되도록 trades에 기록)
     last_bar_idx = len(df) - 1
     close_price = float(df.iloc[-1]["close"])
     if positions:
+        cap_before_final = capital
         exit_side = positions[0]["side"]
         for pos in positions:
             notional = pos["entry_capital"] * pos["size_pct"] * leverage
@@ -528,6 +645,7 @@ def run_backtest(
                 size_pct=0,
                 fee=0,
                 detail={"reason": "end_of_backtest"},
+                pnl=capital - cap_before_final,
             )
         )
 
@@ -538,6 +656,31 @@ def run_backtest(
         "last_ts": int(df.iloc[-1]["open_time"]) if "open_time" in df.columns else None,
     }
     return trades, equity_series, capital, info, df
+
+
+def _risk_metrics(equity: pd.Series, periods_per_year: float = 8760.0) -> dict:
+    """
+    자산 곡선에서 최대 낙폭(MaxDD), 샤프, 소르티노, 칼마 비율 계산.
+    periods_per_year: 1시간봉 기준 8760.
+    """
+    if equity is None or len(equity) < 2:
+        return {"max_drawdown_pct": 0.0, "sharpe_annual": 0.0, "sortino_annual": 0.0, "calmar_annual": 0.0}
+    equity = equity.astype(float)
+    cummax = equity.cummax()
+    drawdown_pct = (equity - cummax) / cummax.replace(0, np.nan)
+    max_dd_pct = float(drawdown_pct.min() * 100) if cummax.max() > 0 else 0.0
+    rets = equity.pct_change().dropna()
+    if len(rets) < 2:
+        return {"max_drawdown_pct": max_dd_pct, "sharpe_annual": 0.0, "sortino_annual": 0.0, "calmar_annual": 0.0}
+    mean_ret = float(rets.mean())
+    std_ret = float(rets.std())
+    sharpe = (mean_ret / std_ret * np.sqrt(periods_per_year)) if std_ret > 0 else 0.0
+    downside = rets[rets < 0]
+    downside_std = float(downside.std()) if len(downside) > 1 else 0.0
+    sortino = (mean_ret / downside_std * np.sqrt(periods_per_year)) if downside_std > 0 else (sharpe if mean_ret > 0 else 0.0)
+    total_ret = float(equity.iloc[-1] / equity.iloc[0] - 1.0) if equity.iloc[0] > 0 else 0.0
+    calmar = (total_ret * 100 / abs(max_dd_pct)) if max_dd_pct != 0 else (total_ret * 100 if total_ret >= 0 else 0.0)
+    return {"max_drawdown_pct": max_dd_pct, "sharpe_annual": sharpe, "sortino_annual": sortino, "calmar_annual": calmar}
 
 
 def _yearly_performance(
@@ -581,6 +724,104 @@ def _yearly_performance(
     return result
 
 
+# 수익률이 안 좋은 연도만 월별·일별 상세 출력 (22, 25, 26년)
+YEARS_WITH_DETAILED_OUTPUT = (2022, 2025, 2026)
+
+
+def _monthly_performance(
+    df: pd.DataFrame,
+    equity: pd.Series,
+    trades: List[BacktestTrade],
+    initial: float,
+) -> List[dict]:
+    """
+    봉별 시각으로 연·월별 수익률·자산 계산.
+    equity[k] = (df 인덱스 k+1 봉 처리 후) 자산.
+    """
+    if df is None or "open_time" not in df.columns or equity.empty or len(equity) < 2:
+        return []
+    df = df.copy()
+    dt = pd.to_datetime(df["open_time"], unit="ms")
+    df["_year"] = dt.dt.year
+    df["_month"] = dt.dt.month
+    result = []
+    for (year, month), grp in df.groupby(["_year", "_month"], sort=True):
+        bar_indices = grp.index.tolist()
+        if not bar_indices:
+            continue
+        j_min, j_max = min(bar_indices), max(bar_indices)
+        if j_min <= 1:
+            start_equity = initial
+        else:
+            start_equity = float(equity.iloc[j_min - 2])
+        end_equity = float(equity.iloc[j_max - 1])
+        ret_pct = (end_equity / start_equity - 1) * 100 if start_equity > 0 else 0.0
+        trades_in_period = [
+            t for t in trades
+            if 0 <= t.bar_idx < len(df)
+            and df.iloc[t.bar_idx]["_year"] == year
+            and df.iloc[t.bar_idx]["_month"] == month
+        ]
+        result.append({
+            "year": year,
+            "month": month,
+            "year_month": f"{year}-{month:02d}",
+            "start_equity": start_equity,
+            "end_equity": end_equity,
+            "return_pct": ret_pct,
+            "n_trades": len(trades_in_period),
+        })
+    return result
+
+
+def _daily_performance(
+    df: pd.DataFrame,
+    equity: pd.Series,
+    trades: List[BacktestTrade],
+    initial: float,
+    year: int,
+) -> List[dict]:
+    """
+    특정 연도에 한해 일별 수익률·자산 계산.
+    equity[k] = (df 인덱스 k+1 봉 처리 후) 자산.
+    """
+    if df is None or "open_time" not in df.columns or equity.empty or len(equity) < 2:
+        return []
+    df = df.copy()
+    dt = pd.to_datetime(df["open_time"], unit="ms")
+    df["_year"] = dt.dt.year
+    df["_date"] = dt.dt.date
+    grp_year = df[df["_year"] == year]
+    if grp_year.empty:
+        return []
+    result = []
+    for date_val, grp in grp_year.groupby("_date", sort=True):
+        bar_indices = grp.index.tolist()
+        if not bar_indices:
+            continue
+        j_min, j_max = min(bar_indices), max(bar_indices)
+        if j_min <= 1:
+            start_equity = initial
+        else:
+            start_equity = float(equity.iloc[j_min - 2])
+        end_equity = float(equity.iloc[j_max - 1])
+        ret_pct = (end_equity / start_equity - 1) * 100 if start_equity > 0 else 0.0
+        trades_in_period = [
+            t for t in trades
+            if 0 <= t.bar_idx < len(df)
+            and df.iloc[t.bar_idx]["_year"] == year
+            and df.iloc[t.bar_idx]["_date"] == date_val
+        ]
+        result.append({
+            "date": date_val,
+            "start_equity": start_equity,
+            "end_equity": end_equity,
+            "return_pct": ret_pct,
+            "n_trades": len(trades_in_period),
+        })
+    return result
+
+
 def print_backtest_summary(
     trades: List[BacktestTrade],
     equity: pd.Series,
@@ -591,35 +832,63 @@ def print_backtest_summary(
 ):
     """백테스트 결과 요약 출력. df가 주어지면 연도별 성과를 함께 출력."""
     opens = sum(1 for t in trades if t.action in ("OPEN_1", "OPEN_2"))
+    open_adds = sum(1 for t in trades if t.action == "OPEN_ADD")
     stops = sum(1 for t in trades if t.action == "STOP")
+    liquidations = sum(1 for t in trades if t.action == "LIQUIDATION")
     trail_stops = sum(1 for t in trades if t.action == "TRAILING_STOP")
     trend_exits = sum(1 for t in trades if t.action == "TREND_BREAK_EXIT")
     eod_exits = sum(1 for t in trades if t.action == "EOD_EXIT")
     eoy_locks = sum(1 for t in trades if t.action == "EOY_PROFIT_LOCK")
     giveback_exits = sum(1 for t in trades if t.action == "GIVEBACK_EXIT")
     reverse_engulf = sum(1 for t in trades if t.action == "REVERSE_ENGULF_EXIT")
+    tp_4h_wick = sum(1 for t in trades if t.action == "TP_4H_WICK_EXIT")
     final_settlements = sum(1 for t in trades if t.action == "FINAL_SETTLEMENT")
     tps = sum(1 for t in trades if t.action == "TP_FIRST")
     print("=== 백테스트 요약 ===")
-    print(f"초기 자본: {initial:,.2f} USDT")
-    print(f"최종 자산: {final_capital:,.2f} USDT")
-    print(f"수익률: {(final_capital/initial - 1)*100:.2f}%")
-    print(f"거래 이벤트(진입+익절+손절) 합계: {len(trades)}")
-    print(f"  - 진입: {opens}, 1차 익절: {tps}, 손절: {stops}, 트레일: {trail_stops}, 4h이탈: {trend_exits}, 일종료: {eod_exits}, 연말확정: {eoy_locks}, 고점되돌림: {giveback_exits}, 반대장악: {reverse_engulf}, 종료정산: {final_settlements}")
-    close_events = stops + trail_stops + trend_exits + eod_exits + eoy_locks + giveback_exits + reverse_engulf + final_settlements
-    if close_events > 0:
-        win_ratio = tps / (close_events + tps) * 100 if (close_events + tps) > 0 else 0
-        print(f"  - 1차 익절 vs 청산: 익절 {tps}회 / 손절 {stops}회 / 트레일 {trail_stops}회 / 4h이탈 {trend_exits}회 / 일종료 {eod_exits}회 / 연말확정 {eoy_locks}회 / 고점되돌림 {giveback_exits}회 / 반대장악 {reverse_engulf}회 / 종료정산 {final_settlements}회 -> 익절 비율 약 {win_ratio:.1f}%")
+    print(f"초기 자본: {initial:,.2f} USDT  →  최종 자산: {final_capital:,.2f} USDT  (수익률 {(final_capital/initial - 1)*100:.2f}%)")
+    print(f"거래: 진입 {opens}회, 1차 익절 {tps}회, 손절 {stops}회, 연말확정 {eoy_locks}회, 종료정산 {final_settlements}회  (총 {len(trades)}건)")
+    close_events = stops + liquidations + trail_stops + trend_exits + eod_exits + eoy_locks + giveback_exits + reverse_engulf + tp_4h_wick + final_settlements
+    if close_events + tps > 0:
+        win_ratio = tps / (close_events + tps) * 100
+        print(f"익절 비율: {win_ratio:.1f}%")
+
+    # 롱/숏별 청산 통계: 승률, 누적 손익(USDT), 초기자본 대비 수익률
+    close_actions = (
+        "TP_FIRST", "STOP", "TRAILING_STOP", "TREND_BREAK_EXIT", "EOD_EXIT", "EOY_PROFIT_LOCK",
+        "GIVEBACK_EXIT", "REVERSE_ENGULF_EXIT", "TP_4H_WICK_EXIT", "LIQUIDATION", "FINAL_SETTLEMENT",
+    )
+    by_side = {}
+    for t in trades:
+        if t.action in close_actions and getattr(t, "pnl", None) is not None:
+            side = t.side
+            if side not in by_side:
+                by_side[side] = {"n": 0, "wins": 0, "pnl_sum": 0.0}
+            by_side[side]["n"] += 1
+            if t.pnl > 0:
+                by_side[side]["wins"] += 1
+            by_side[side]["pnl_sum"] += t.pnl
+    print("\n=== 롱/숏별 청산 성과 ===")
+    print(f"{'구분':<6} {'청산':>6} {'승':>4} {'승률':>6} {'누적손익(USDT)':>14} {'초기대비':>10}")
+    print("-" * 52)
+    for side in ("LONG", "SHORT"):
+        d = by_side.get(side, {"n": 0, "wins": 0, "pnl_sum": 0.0})
+        n = d["n"]
+        wins = d["wins"]
+        wr = (wins / n * 100) if n else 0
+        pnl_sum = d["pnl_sum"]
+        ret_pct = (pnl_sum / initial * 100) if initial and initial > 0 else 0
+        print(f"{side:<6} {n:>6} {wins:>4} {wr:>5.1f}% {pnl_sum:>+13,.2f} {ret_pct:>+9.2f}%")
+    if by_side.get("SHORT", {}).get("n", 0) == 0:
+        print("  (롱 전용 전략)")
+
     if not equity.empty:
-        print(f"최대 자산: {equity.max():,.2f} USDT")
-        print(f"최소 자산: {equity.min():,.2f} USDT")
+        risk = _risk_metrics(equity, periods_per_year=8760.0)
+        print(f"최대/최소 자산: {float(equity.max()):,.2f} / {float(equity.min()):,.2f} USDT  |  최대낙폭 {risk['max_drawdown_pct']:.2f}%  |  샤프 {risk['sharpe_annual']:.2f}  칼마 {risk['calmar_annual']:.2f}")
     if info and info.get("first_ts") and info.get("last_ts"):
         from datetime import datetime
         start_d = datetime.utcfromtimestamp(info["first_ts"] / 1000).strftime("%Y-%m-%d")
         end_d = datetime.utcfromtimestamp(info["last_ts"] / 1000).strftime("%Y-%m-%d")
-        print(f"백테스트 구간: {start_d} ~ {end_d} (총 {info.get('n_bars', 0):,}봉)")
-    fill_note = "해당 봉 (고+저)/2 체결" if getattr(config, "FILL_USE_MID", False) else "해당 봉 종가 체결"
-    print(f"(진입가: CONSERVATIVE_FILL=True → {fill_note} 가정)")
+        print(f"구간: {start_d} ~ {end_d} ({info.get('n_bars', 0):,}봉)")
 
     # 연도별 성과
     if df is not None and not equity.empty:
@@ -636,4 +905,23 @@ def print_backtest_summary(
                     f"{row['return_pct']:>9.2f}% "
                     f"{row['n_trades']:>8}"
                 )
-            print("  ※ 거래수=해당 연도 발생한 진입·익절·손절·트레일·4h이탈·종료정산 이벤트 수. 0=해당 연도엔 청산/진입 없이 포지션만 유지(자산은 미실현 손익으로 변동).")
+
+        # 수익률이 안 좋은 연도(22, 25, 26년)만 월별·일별 상세 출력
+        monthly = _monthly_performance(df, equity, trades, initial)
+        monthly_detail = [r for r in monthly if r["year"] in YEARS_WITH_DETAILED_OUTPUT]
+        if monthly_detail:
+            print("\n=== 연도별 월별 자산·수익률 (수익률 저조 연도: 2022, 2025, 2026년) ===")
+            from itertools import groupby
+            for year, rows in groupby(monthly_detail, key=lambda r: r["year"]):
+                rows = list(rows)
+                print(f"\n  --- {year}년 ---")
+                print(f"  {'월':<4} {'월초자산':>12} {'월말자산':>12} {'월수익률':>10} {'거래수':>6}")
+                print("  " + "-" * 48)
+                for r in rows:
+                    print(
+                        f"  {r['month']:>2}월 "
+                        f"{r['start_equity']:>11,.2f} "
+                        f"{r['end_equity']:>11,.2f} "
+                        f"{r['return_pct']:>9.2f}% "
+                        f"{r['n_trades']:>6}"
+                    )

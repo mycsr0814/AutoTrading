@@ -109,6 +109,12 @@ def add_engulfing_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def pullback_level_from_low(low: float, high: float, pct: float) -> float:
-    """봉 범위의 pct(0~1)만큼 아래에서의 가격. 0.2면 20% 눌림 수준."""
+    """봉 범위의 pct(0~1)만큼 아래에서의 가격. 0.2면 20% 눌림 수준 (롱 1차 진입)."""
     r = high - low
     return low + (1.0 - pct) * r if r > 0 else low
+
+
+def pullback_level_from_high(high: float, low: float, pct: float) -> float:
+    """봉 범위의 pct(0~1)만큼 위에서의 가격. 0.2면 20% 반등 수준 (숏 1차 진입). 롱과 대칭."""
+    r = high - low
+    return high - pct * r if r > 0 else high

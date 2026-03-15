@@ -160,6 +160,15 @@ def run_live_bot():
     except Exception as e:
         logger.warning("레버리지 설정 실패 (이미 설정됐을 수 있음): %s", e)
 
+    min_notional = getattr(config, "MIN_ORDER_NOTIONAL_USDT", 5.0)
+    balance = client.get_usdt_balance()
+    min_balance_approx = min_notional / (config.FIRST_ENTRY_PCT * config.LEVERAGE)
+    if balance < min_balance_approx and balance > 0:
+        logger.warning(
+            "USDT 잔고(%.2f)가 적어 1차 진입 시 주문이 거부될 수 있습니다. 권장: 약 %.0f USDT 이상.",
+            balance, min_balance_approx,
+        )
+
     state = StrategyState()
     last_bar_time = None
     # 백테스트와 동일: 1차 익절은 "첫 진입(OPEN_1) 물량의 40%"만 청산. 끊김 시 파일에서 복구.
@@ -209,17 +218,30 @@ def run_live_bot():
                 if action in ("OPEN_1", "OPEN_2") and detail:
                     try:
                         balance = client.get_usdt_balance()
+                        min_notional = getattr(config, "MIN_ORDER_NOTIONAL_USDT", 5.0)
+                        if balance < 1e-6:
+                            logger.warning("USDT 잔고 없음. 진입 스킵.")
+                            time.sleep(60)
+                            continue
                         size_pct = detail.get("size_pct", 0.1)
                         margin = balance * size_pct
-                        qty = (margin * config.LEVERAGE) / float(row["close"])
+                        price = float(row["close"])
+                        qty = (margin * config.LEVERAGE) / price
                         qty = round(qty, 3)
-                        if qty > 0:
-                            side = "BUY" if state.positions and state.positions[-1].side == "LONG" else "SELL"
-                            client.create_market_order(config.SYMBOL, side, qty, reduce_only=False)
-                            logger.info("진입: %s %s @ ~%s", side, qty, row["close"])
-                            if action == "OPEN_1":
-                                first_entry_qty = qty
-                                _save_first_entry_qty(first_entry_qty)
+                        notional = qty * price
+                        if qty <= 0 or notional < min_notional:
+                            logger.warning(
+                                "주문 명목가 %.2f USDT < 최소 %.2f USDT. 진입 스킵. (잔고: %.2f USDT)",
+                                notional, min_notional, balance,
+                            )
+                            time.sleep(60)
+                            continue
+                        side = "BUY" if state.positions and state.positions[-1].side == "LONG" else "SELL"
+                        client.create_market_order(config.SYMBOL, side, qty, reduce_only=False)
+                        logger.info("진입: %s %s @ ~%s", side, qty, price)
+                        if action == "OPEN_1":
+                            first_entry_qty = qty
+                            _save_first_entry_qty(first_entry_qty)
                     except Exception as e:
                         logger.exception("진입 주문 실패: %s", e)
 

@@ -17,6 +17,8 @@ BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
 SYMBOL = "ETHUSDT"
 LEVERAGE = 6
 INTERVAL_1H = "1h"
+# 바이낸스 선물 최소 주문 명목가(USDT). 미만이면 주문 거부됨.
+MIN_ORDER_NOTIONAL_USDT = 5.0
 
 # --- 포지션 비중 (5년 백테스트 12% 수익률 구간 설정) ---
 FIRST_ENTRY_PCT = 0.12   # 첫 진입: 자금의 12%

@@ -1,0 +1,24 @@
+# AutoTrading 봇 systemd 서비스 (24시간 실행)
+# 설치: deploy/setup_server.sh 실행 시 경로가 자동 치환되어 복사됨
+# 수동 설치: sudo cp deploy/autotrading.service /etc/systemd/system/
+#            경로를 실제 프로젝트 경로로 수정 후 sudo systemctl daemon-reload
+
+[Unit]
+Description=AutoTrading Binance Futures Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/AutoTrading
+Environment=PATH=/home/ubuntu/AutoTrading/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/AutoTrading/.venv/bin/python -u main.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/ubuntu/AutoTrading/logs/autotrading.log
+StandardError=append:/home/ubuntu/AutoTrading/logs/autotrading.log
+
+[Install]
+WantedBy=multi-user.target

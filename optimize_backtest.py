@@ -77,7 +77,6 @@ def main():
             "TP_FIRST_HALF": [0.4, 0.6],
             "TP_RR_RATIO": [2.5, 3.0],
             "ENGULF_BODY_RATIO_MIN": [1.2, 1.35],
-            "REMAINDER_EXIT_MODE": ["original_stop", "trend_break_4h"],
         }
     else:
         grid = {
@@ -86,7 +85,6 @@ def main():
             "TP_FIRST_HALF": [0.4, 0.5, 0.6],
             "TP_RR_RATIO": [2.5, 3.0],
             "ENGULF_BODY_RATIO_MIN": [1.2, 1.25, 1.3, 1.35],
-            "REMAINDER_EXIT_MODE": ["original_stop", "trend_break_4h"],
         }
 
     keys = list(grid.keys())
@@ -103,7 +101,7 @@ def main():
         results.append(r)
         print(f"  [{idx}/{n_total}] final={r['final']:.2f} ret={r['return_pct']:.1f}% "
               f"| TREND={params['TREND_4H_MIN_PCT_ABOVE_EMA']} EXIT_OPP={params['EXIT_ON_OPPOSITE_ENGULF']} "
-              f"TP_HALF={params['TP_FIRST_HALF']} RR={params['TP_RR_RATIO']} ENGULF={params['ENGULF_BODY_RATIO_MIN']} REMAINDER={params['REMAINDER_EXIT_MODE']}")
+              f"TP_HALF={params['TP_FIRST_HALF']} RR={params['TP_RR_RATIO']} ENGULF={params['ENGULF_BODY_RATIO_MIN']}")
 
     # 최종 자산 기준 정렬
     results.sort(key=lambda x: x["final"], reverse=True)
@@ -134,7 +132,7 @@ def main():
         import re
         for key, value in best_params.items():
             if key not in ("TREND_4H_MIN_PCT_ABOVE_EMA", "EXIT_ON_OPPOSITE_ENGULF",
-                           "TP_FIRST_HALF", "TP_RR_RATIO", "ENGULF_BODY_RATIO_MIN", "REMAINDER_EXIT_MODE"):
+                           "TP_FIRST_HALF", "TP_RR_RATIO", "ENGULF_BODY_RATIO_MIN"):
                 continue
             if isinstance(value, bool):
                 pattern = rf"({key}\s*=\s*)(True|False)"

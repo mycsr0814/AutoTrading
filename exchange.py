@@ -4,9 +4,11 @@ import time
 import logging
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
+import random
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
+import requests
 
 import config
 
@@ -16,6 +18,19 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 5
 RETRY_DELAY = 2
 RETRY_STATUS_CODES = {418, 429, 500, 502, 503, 504}
+RETRYABLE_REQUEST_EXC = (
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
+
+def _sleep_backoff(attempt: int) -> None:
+    """재시도 백오프(지수 + 지터). attempt=0부터."""
+    base = RETRY_DELAY * (2 ** attempt)
+    jitter = random.uniform(0, 0.3 * base)
+    time.sleep(min(30.0, base + jitter))
 
 
 def _retry_request(func):
@@ -25,11 +40,16 @@ def _retry_request(func):
         for attempt in range(MAX_RETRIES):
             try:
                 return func(*args, **kwargs)
+            except RETRYABLE_REQUEST_EXC as e:
+                last_exc = e
+                logger.warning("네트워크 타임아웃/연결 오류 재시도 %s/%s: %s", attempt + 1, MAX_RETRIES, e)
+                _sleep_backoff(attempt)
+                continue
             except BinanceRequestException as e:
                 last_exc = e
                 if hasattr(e, "status_code") and e.status_code in RETRY_STATUS_CODES:
                     logger.warning("재시도 %s/%s: %s", attempt + 1, MAX_RETRIES, e)
-                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    _sleep_backoff(attempt)
                     continue
                 raise
             except BinanceAPIException as e:
@@ -37,7 +57,7 @@ def _retry_request(func):
                 if e.code in (-1015, -1003):
                     last_exc = e
                     logger.warning("요청 제한 재시도 %s/%s", attempt + 1, MAX_RETRIES)
-                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    _sleep_backoff(attempt)
                     continue
                 raise
         raise last_exc
@@ -66,10 +86,13 @@ class BinanceFuturesClient:
         if self._client is None:
             if not self._api_key or not self._api_secret:
                 raise ValueError("BINANCE_API_KEY, BINANCE_API_SECRET를 .env에 설정하세요.")
+            connect_timeout = getattr(config, "BINANCE_CONNECT_TIMEOUT_SEC", 3)
+            read_timeout = getattr(config, "BINANCE_READ_TIMEOUT_SEC", 20)
             self._client = Client(
                 self._api_key,
                 self._api_secret,
                 testnet=self._testnet,
+                requests_params={"timeout": (connect_timeout, read_timeout)},
             )
         return self._client
 

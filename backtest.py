@@ -341,6 +341,14 @@ def run_backtest(
     fee_entry = fee_entry if fee_entry is not None else getattr(config, "FEE_ENTRY", config.FEE_MAKER)
     df = prepare_1h_df_for_signal(df)
 
+    # 펀딩비 설정 (선물 롱/숏 포지션 보유 비용/수익)
+    funding_enabled = getattr(config, "FUNDING_ENABLED", False)
+    # 설정값은 "4시간당" 펀딩 비율이므로, 1시간봉 루프에서는 4로 나눠 시간당으로 균등 분배
+    funding_rate_long_4h = getattr(config, "FUNDING_RATE_PER_4H_LONG", 0.0) or 0.0
+    funding_rate_short_4h = getattr(config, "FUNDING_RATE_PER_4H_SHORT", 0.0) or 0.0
+    funding_rate_long_per_hour = funding_rate_long_4h / 4.0
+    funding_rate_short_per_hour = funding_rate_short_4h / 4.0
+
     capital = initial_capital
     state = StrategyState()
     trades: List[BacktestTrade] = []
@@ -473,7 +481,7 @@ def run_backtest(
             i, row, prev_row, df.iloc[: i + 1], state, fee_rate=fee_rate
         )
 
-        if action in ("OPEN_1", "OPEN_2", "OPEN_ADD", "OPEN_TREND_ADD"):
+        if action in ("OPEN_1", "OPEN_2"):
             if detail:
                 entry_price = detail.get("entry", close_price)
                 stop_price = detail.get("stop")
@@ -561,16 +569,7 @@ def run_backtest(
                 )
             )
 
-        elif action in (
-            "STOP",
-            "TRAILING_STOP",
-            "TREND_BREAK_EXIT",
-            "EOD_EXIT",
-            "EOY_PROFIT_LOCK",
-            "GIVEBACK_EXIT",
-            "REVERSE_ENGULF_EXIT",
-            "TP_4H_WICK_EXIT",
-        ):
+        elif action in ("STOP", "EOY_PROFIT_LOCK", "REVERSE_ENGULF_EXIT"):
             exit_price = (detail.get("price", close_price) if detail else close_price)
             capital, trade = _close_all_positions(
                 positions, exit_price, capital, leverage, fee_rate, i, action, detail
@@ -579,7 +578,22 @@ def run_backtest(
             if trade:
                 trades.append(trade)
 
-        # 미실현 손익 (포지션 유지 중)
+        # 펀딩비: 포지션 보유 중인 1시간봉마다 명목가 × (4시간당 비율 / 4) 만큼 자본에서 차감/가산
+        if funding_enabled and positions:
+            total_notional_long = 0.0
+            total_notional_short = 0.0
+            for pos in positions:
+                notional = pos["entry_capital"] * pos["size_pct"] * leverage
+                if pos["side"] == "LONG":
+                    total_notional_long += notional
+                else:
+                    total_notional_short += notional
+            if funding_rate_long_per_hour:
+                capital -= total_notional_long * funding_rate_long_per_hour
+            if funding_rate_short_per_hour:
+                capital -= total_notional_short * funding_rate_short_per_hour
+
+        # 미실현 손익 (포지션 유지 중, 펀딩비 차감 이후 기준)
         total_unrealized = 0.0
         for pos in positions:
             notional = pos["entry_capital"] * pos["size_pct"] * leverage
@@ -832,31 +846,26 @@ def print_backtest_summary(
 ):
     """백테스트 결과 요약 출력. df가 주어지면 연도별 성과를 함께 출력."""
     opens = sum(1 for t in trades if t.action in ("OPEN_1", "OPEN_2"))
-    open_adds = sum(1 for t in trades if t.action == "OPEN_ADD")
     stops = sum(1 for t in trades if t.action == "STOP")
     liquidations = sum(1 for t in trades if t.action == "LIQUIDATION")
-    trail_stops = sum(1 for t in trades if t.action == "TRAILING_STOP")
-    trend_exits = sum(1 for t in trades if t.action == "TREND_BREAK_EXIT")
-    eod_exits = sum(1 for t in trades if t.action == "EOD_EXIT")
     eoy_locks = sum(1 for t in trades if t.action == "EOY_PROFIT_LOCK")
-    giveback_exits = sum(1 for t in trades if t.action == "GIVEBACK_EXIT")
     reverse_engulf = sum(1 for t in trades if t.action == "REVERSE_ENGULF_EXIT")
-    tp_4h_wick = sum(1 for t in trades if t.action == "TP_4H_WICK_EXIT")
     final_settlements = sum(1 for t in trades if t.action == "FINAL_SETTLEMENT")
     tps = sum(1 for t in trades if t.action == "TP_FIRST")
     print("=== 백테스트 요약 ===")
     print(f"초기 자본: {initial:,.2f} USDT  →  최종 자산: {final_capital:,.2f} USDT  (수익률 {(final_capital/initial - 1)*100:.2f}%)")
     print(f"거래: 진입 {opens}회, 1차 익절 {tps}회, 손절 {stops}회, 연말확정 {eoy_locks}회, 종료정산 {final_settlements}회  (총 {len(trades)}건)")
-    close_events = stops + liquidations + trail_stops + trend_exits + eod_exits + eoy_locks + giveback_exits + reverse_engulf + tp_4h_wick + final_settlements
+    # 레버리지 백테스트에서 손절 vs 거래소 청산 우선순위 통계
+    if stops or liquidations:
+        print(f"손절이 먼저 닿아 청산된 경우: {stops}회")
+        print(f"거래소 청산가(레버리지 기준)가 손절보다 먼저 닿은 경우: {liquidations}회")
+    close_events = stops + liquidations + eoy_locks + reverse_engulf + final_settlements
     if close_events + tps > 0:
         win_ratio = tps / (close_events + tps) * 100
         print(f"익절 비율: {win_ratio:.1f}%")
 
     # 롱/숏별 청산 통계: 승률, 누적 손익(USDT), 초기자본 대비 수익률
-    close_actions = (
-        "TP_FIRST", "STOP", "TRAILING_STOP", "TREND_BREAK_EXIT", "EOD_EXIT", "EOY_PROFIT_LOCK",
-        "GIVEBACK_EXIT", "REVERSE_ENGULF_EXIT", "TP_4H_WICK_EXIT", "LIQUIDATION", "FINAL_SETTLEMENT",
-    )
+    close_actions = ("TP_FIRST", "STOP", "EOY_PROFIT_LOCK", "REVERSE_ENGULF_EXIT", "LIQUIDATION", "FINAL_SETTLEMENT")
     by_side = {}
     for t in trades:
         if t.action in close_actions and getattr(t, "pnl", None) is not None:

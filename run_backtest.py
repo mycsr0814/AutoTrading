@@ -96,7 +96,8 @@ def _run_single_with_params(df, initial: float, params: dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ETH 1h 백테스트")
+    symbol = getattr(config, "SYMBOL", "ETHUSDT")
+    parser = argparse.ArgumentParser(description=f"{symbol} 1h 백테스트")
     parser.add_argument(
         "--compare-periods",
         action="store_true",
@@ -116,11 +117,6 @@ def main():
         "--optimize-entry-tp",
         action="store_true",
         help="진입·익절 파라미터 그리드 탐색 후 최종 자산 최대 조합 출력 (선택 시 config 반영)",
-    )
-    parser.add_argument(
-        "--compare-4h-wick-addon",
-        action="store_true",
-        help="기존 전략 vs 4h윗꼬리 익절 vs 추가진입(7%) vs 둘 다 적용 — 4가지 비교 후 결과 표 출력",
     )
     parser.add_argument(
         "--apply-best",
@@ -154,7 +150,7 @@ def main():
     )
     args = parser.parse_args()
 
-    logger.info("%d년 ETH 1h 데이터 로드 중...", args.years)
+    logger.info("%d년 %s 1h 데이터 로드 중...", args.years, symbol)
     df = load_or_fetch_1h(years=args.years, force_refresh=False)
     if df is None or len(df) < 100:
         logger.error("데이터 부족. .env에 바이낸스 API 키를 설정한 뒤 다시 시도하세요.")
@@ -259,7 +255,7 @@ def main():
                 df, initial_capital=initial, leverage=config.LEVERAGE, fee_rate=config.FEE_EFFECTIVE
             )
             ret_pct = (final / initial - 1) * 100
-            n_entries = sum(1 for t in trades if t.action in ("OPEN_1", "OPEN_2", "OPEN_ADD"))
+            n_entries = sum(1 for t in trades if t.action in ("OPEN_1", "OPEN_2"))
             results.append((label, final, ret_pct, n_entries))
         print("\n=== 숏 진입 방식 비교 ===")
         print(f"{'방식':<32} {'최종자산':>12} {'수익률':>10} {'진입수':>8}")
@@ -269,57 +265,6 @@ def main():
         best = max(results, key=lambda x: x[1])
         print(f"\n  → 최종자산 기준 베스트: {best[0]}")
         config.DAILY_WICK_BEAR_SHORT_ENABLED = best[0] == "기존 + 일봉 윗꼬리+음봉 숏"
-        return 0
-
-    if args.compare_4h_wick_addon:
-        # 기존 vs 4h윗꼬리 익절 vs 추가진입(7%) vs 둘 다 — 비교
-        backup_wick = getattr(config, "TP_4H_WICK_EXIT_ENABLED", False)
-        backup_addon = getattr(config, "ADD_ON_ENTRY_ENABLED", False)
-        scenarios = [
-            ("기존 전략 (4h윗꼬리·추가진입 없음)", False, False),
-            ("4h 윗꼬리 익절만 (윗꼬리>4×몸통 후 저가대비 20% 반등 시 익절)", True, False),
-            ("추가 진입만 (포지션 보유 중 신호 시 7%)", False, True),
-            ("4h 윗꼬리 익절 + 추가 진입", True, True),
-        ]
-        results = []
-        try:
-            for label, wick_on, addon_on in scenarios:
-                config.TP_4H_WICK_EXIT_ENABLED = wick_on
-                config.ADD_ON_ENTRY_ENABLED = addon_on
-                trades, equity, final, info, _ = run_backtest(
-                    df, initial_capital=initial, leverage=config.LEVERAGE, fee_rate=config.FEE_EFFECTIVE
-                )
-                ret_pct = (final / initial - 1) * 100
-                n_entries = sum(1 for t in trades if t.action in ("OPEN_1", "OPEN_2", "OPEN_ADD"))
-                n_stops = sum(1 for t in trades if t.action == "STOP")
-                n_tp = sum(1 for t in trades if t.action == "TP_FIRST")
-                n_tp_4h = sum(1 for t in trades if t.action == "TP_4H_WICK_EXIT")
-                n_open_add = sum(1 for t in trades if t.action == "OPEN_ADD")
-                results.append({
-                    "label": label,
-                    "final": final,
-                    "ret_pct": ret_pct,
-                    "n_entries": n_entries,
-                    "n_stops": n_stops,
-                    "n_tp": n_tp,
-                    "n_tp_4h": n_tp_4h,
-                    "n_open_add": n_open_add,
-                })
-        finally:
-            config.TP_4H_WICK_EXIT_ENABLED = backup_wick
-            config.ADD_ON_ENTRY_ENABLED = backup_addon
-        print("\n=== 4h 윗꼬리 익절 · 추가 진입 비교 ===")
-        print(
-            f"{'전략':<42} {'최종자산':>12} {'수익률':>10} {'진입':>6} {'추가':>6} {'손절':>6} {'1차TP':>6} {'4h윗꼬리':>8}"
-        )
-        print("-" * 100)
-        for r in results:
-            print(
-                f"{r['label']:<42} {r['final']:>11,.2f} {r['ret_pct']:>9.2f}% "
-                f"{r['n_entries']:>6} {r['n_open_add']:>6} {r['n_stops']:>6} {r['n_tp']:>6} {r['n_tp_4h']:>8}"
-            )
-        best = max(results, key=lambda x: x["final"])
-        print(f"\n  → 최종자산 기준 베스트: {best['label']}")
         return 0
 
     if args.optimize_entry_tp:

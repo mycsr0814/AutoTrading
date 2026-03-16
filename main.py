@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import requests
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 
 import config
 from exchange import BinanceFuturesClient
@@ -228,6 +230,7 @@ def run_live_bot():
 
     state = StrategyState()
     last_bar_time = None
+    consecutive_api_failures = 0
     # 백테스트와 동일: 1차 익절은 "첫 진입(OPEN_1) 물량의 40%"만 청산. 진입 직후 TP/손절 주문 ID·손절가 복구.
     first_entry_qty, tp_order_id, stop_order_id, stop_price = _load_live_state()
     pos_qty, _ = _get_position_info(client)
@@ -332,7 +335,7 @@ def run_live_bot():
                 logger.info("신호: %s %s", action, detail)
                 last_bar_time = current_bar_time
 
-                if action in ("OPEN_1", "OPEN_2", "OPEN_ADD", "OPEN_TREND_ADD") and detail:
+                if action in ("OPEN_1", "OPEN_2") and detail:
                     try:
                         balance = client.get_usdt_balance()
                         min_notional = getattr(config, "MIN_ORDER_NOTIONAL_USDT", 5.0)
@@ -464,10 +467,17 @@ def run_live_bot():
                     except Exception as e:
                         logger.exception("청산 주문 실패 (%s): %s", action, e)
 
+            consecutive_api_failures = 0
             time.sleep(60)
         except KeyboardInterrupt:
             logger.info("봇 종료")
             break
+        except (requests.exceptions.RequestException, BinanceRequestException, BinanceAPIException) as e:
+            # 네트워크/API 일시 장애: 스택트레이스 로그 스팸을 줄이고, 점진적 대기 후 재시도
+            consecutive_api_failures += 1
+            sleep_s = min(300, 10 * consecutive_api_failures)
+            logger.warning("네트워크/API 오류: %s (연속 %d회) → %d초 후 재시도", e, consecutive_api_failures, sleep_s)
+            time.sleep(sleep_s)
         except Exception as e:
             logger.exception("루프 오류: %s", e)
             time.sleep(60)
